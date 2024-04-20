@@ -133,6 +133,5 @@ fn main() -> Result<()> {
     if let Some(value) = thread {
         let _ = value.join();
     }
-    println!("Ok!");
     Ok(())
 }
