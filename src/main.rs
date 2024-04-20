@@ -123,7 +123,6 @@ fn main() -> Result<()> {
                 brightness = target;
             }
 
-            dbg!(&output);
             let mut file = file.lock().unwrap();
             write!(file, "{}", brightness.0).expect("Failed to write file!");
             std::thread::sleep(std::time::Duration::from_millis(1000 / 100));
