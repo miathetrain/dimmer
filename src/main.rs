@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use glob::glob;
-use humantime::Duration;
+use glob::{glob, Paths};
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use structopt::StructOpt;
 use thiserror::Error;
 
@@ -61,73 +61,9 @@ impl Brightness {
 }
 
 #[derive(Debug, StructOpt)]
-/// Dimmer smoothly transitions your screen from one brightness to another.
-///
-/// ## Examples
-///
-/// Dim the screen to zero brightness over 5 seconds:
-///
-/// `dimmer`
-///
-/// Dim the screen to 30% brightness over 3 seconds, storing the current brightness in the
-/// statefile:
-///
-/// `dimmer --save --duration 3s 30%`
-///
-/// Restore the screen to the previously saved brightness, using 2 seconds:
-///
-/// `dimmer --restore --duration 2s`
 struct Opt {
-    /// Path to the file to write to set the brightness. We'll try to pick this from
-    /// `/sys/class/backlight` if not set.
-    ///
-    #[structopt(long = "set-brightness-path", parse(from_os_str))]
-    brightness_file: Option<PathBuf>,
-
-    /// Path to the file to read the current brightness from. This can be the same file as the file to
-    /// set the brightness.  We'll try to pick this from `/sys/class/backlight` if not set.
-    ///
-    #[structopt(long = "get-brightness-path", parse(from_os_str))]
-    current_brightness_file: Option<PathBuf>,
-
-    /// Path to the file to read the maximum possible brightness from. We'll try to pick this
-    /// from `/sys/class/backlight` if not set.
-    ///
-    #[structopt(long = "max-brightness-path", parse(from_os_str))]
-    max_brightness_file: Option<PathBuf>,
-
-    /// The state file is used to keep track of the original brightness, so we
-    /// can later restore it.
-    ///
-    #[structopt(long, parse(from_os_str))]
-    state_file: Option<PathBuf>,
-
-    /// How long it should take for the screen to go from it's current
-    /// brightness to zero brightness.
-    ///
-    #[structopt(long, default_value = "5s")]
-    duration: Duration,
-
-    /// How many times per second the brightness will be updated.
-    ///
-    #[structopt(long, default_value = "60")]
-    framerate: u64,
-
-    /// Save the current brightness to the statefile.
-    ///
-    #[structopt(long, short)]
-    save: bool,
-
-    /// Restore previously saved brightness from the statefile.
-    ///
     #[structopt(long, short)]
     restore: bool,
-
-    /// The brightness to target. Can either be an absolute value between 0 and the value in the
-    /// file at `max-brightness-path`, or an percentage (e.g. "0%" to "100%").
-    ///
-    #[structopt(default_value = "0")]
-    target_str: String,
 }
 
 const SYS_BACKLIGHT_PREFIX: &str = "/sys/class/backlight";
@@ -135,85 +71,68 @@ const SYS_BACKLIGHT_PREFIX: &str = "/sys/class/backlight";
 fn main() -> Result<()> {
     let opt = Opt::from_args();
 
-    let brightness_file = opt.brightness_file.unwrap_or(find_file("brightness")?);
+    let glob_path = format!("{SYS_BACKLIGHT_PREFIX}/*/brightness");
+    let glob: Paths = glob(&glob_path).expect("Failed to read glob pattern");
 
-    let current_brightness_file = opt
-        .current_brightness_file
-        .unwrap_or(find_file("actual_brightness")?);
+    let mut thread = None;
+    for i in glob {
+        let parent = i.unwrap().parent().unwrap().to_str().unwrap().to_owned();
 
-    let max_brightness_file = opt
-        .max_brightness_file
-        .unwrap_or(find_file("max_brightness")?);
+        let q = parent.clone() + "/brightness";
+        let w = parent.clone() + "/actual_brightness";
+        let e = parent.clone() + "/max_brightness";
+        let brightness_file = Path::new(&q);
+        let current_brightness_file = Path::new(&w);
+        let max_brightness_file = Path::new(&e);
 
-    let state_file = opt.state_file.unwrap_or_else(|| {
-        let dirs = xdg::BaseDirectories::with_prefix("dimmer")
-            .expect("Failed to setup XDG base directories");
-        dirs.place_config_file("stored_brightness")
-            .expect("Failed to create xdg config path")
-    });
+        let stored: Brightness = Brightness::from_file(&current_brightness_file)?;
+        let maximum: Brightness = Brightness::from_file(&max_brightness_file)?;
 
-    let duration = opt.duration.as_secs();
-
-    let stored: Brightness = Brightness::from_file(&current_brightness_file)?;
-    let maximum: Brightness = Brightness::from_file(&max_brightness_file)?;
-
-    if opt.save {
-        save(&state_file, stored)?;
-    }
-
-    let target: Brightness = if opt.restore {
-        Brightness::from_file(state_file)?
-    } else {
-        Brightness::parse_with_percentage(&opt.target_str, maximum)?
-    };
-    let target = if target > maximum { maximum } else { target };
-
-    let total_frames = duration * opt.framerate;
-
-    let (step_size, dimming): (u64, bool) = match (target.0, stored.0) {
-        (t, o) if t > o => ((t - o) / total_frames, false),
-        (t, o) if o > t => ((o - t) / total_frames, true),
-        (_t, _o) => exit(0),
-    };
-
-    let output = File::create(&brightness_file)?;
-    let mut brightness = stored;
-    for _i in 0..total_frames {
-        if dimming {
-            if brightness.0 < step_size {
-                brightness = Brightness(0);
+        let target: Brightness = if opt.restore {
+            if parent == "{SYS_BACKLIGHT_PREFIX}/ddcci9" {
+                Brightness::parse_with_percentage("70", maximum)?
             } else {
-                brightness = Brightness(brightness.0 - step_size);
+                Brightness::parse_with_percentage("100", maximum)?
             }
-        } else if (target.0 - brightness.0) < step_size {
-            brightness = target;
         } else {
-            brightness = Brightness(brightness.0 + step_size);
-        }
+            Brightness::parse_with_percentage("0", maximum)?
+        };
 
-        set_brightness(&output, brightness)?;
-        std::thread::sleep(std::time::Duration::from_millis(1000 / 60));
+        let target = if target > maximum { maximum } else { target };
+
+        let step_size = 4;
+
+        let output = Arc::new(Mutex::new(File::create(&brightness_file)?));
+        let mut brightness = stored;
+
+        let file = Arc::clone(&output);
+
+        thread = Some(thread::spawn(move || loop {
+            if target.0 == brightness.0 {
+                break;
+            }
+            if target.0 == 0 {
+                if brightness.0 < step_size {
+                    brightness = Brightness(0);
+                } else {
+                    brightness = Brightness(brightness.0 - step_size);
+                }
+            } else if (target.0 - brightness.0) < step_size {
+                brightness = target;
+            } else {
+                brightness = target;
+            }
+
+            dbg!(&output);
+            let mut file = file.lock().unwrap();
+            write!(file, "{}", brightness.0).expect("Failed to write file!");
+            std::thread::sleep(std::time::Duration::from_millis(1000 / 100));
+        }));
     }
-    Ok(())
-}
 
-fn find_file(filename: &str) -> Result<PathBuf> {
-    let glob_path = format!("{SYS_BACKLIGHT_PREFIX}/*/{filename}");
-    let path = glob(&glob_path)
-        .context("Failed to glob {glob_path}")?
-        .next()
-        .context("Failed to find match at {glob_path}")?
-        .context("Glob error trying to match {glob_path}")?;
-    Ok(path)
-}
-
-fn set_brightness<F: Write>(mut f: F, brightness: Brightness) -> Result<()> {
-    write!(f, "{}", brightness.0)?;
-    Ok(())
-}
-
-fn save<P: AsRef<Path>>(state_file: P, brightness: Brightness) -> Result<()> {
-    let mut output = File::create(&state_file)?;
-    write!(output, "{}", brightness.0)?;
+    if let Some(value) = thread {
+        let _ = value.join();
+    }
+    println!("Ok!");
     Ok(())
 }
